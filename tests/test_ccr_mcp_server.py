@@ -65,3 +65,29 @@ def test_mcp_retrieves_proxy_stored_content(fresh_store) -> None:
 
     assert result.get("source") == "local"
     assert result["original_content"] == original
+
+
+def test_retrieve_with_query_no_match_returns_content_not_error(fresh_store) -> None:
+    """headroom_retrieve with a query that matches nothing must NOT return
+    'Content not found' when the hash is valid.  The entry exists; only the
+    BM25 search came up empty.  Callers should receive the full original
+    content plus a human-readable note — not a misleading error.  Regression
+    test for issue #1213."""
+    pytest.importorskip("mcp", reason="MCP SDK required")
+    # Store highly repetitive content: BM25 scores will be near-zero for any
+    # query term because IDF collapses on identical tokens.
+    original = json.dumps([{"id": i, "val": "AAPL"} for i in range(30)])
+    hash_key = get_compression_store().store(original, "[compressed]")
+
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    result = asyncio.run(server._retrieve_content(hash_key, query="id_that_never_matches_xyzzy"))
+
+    # Must NOT be an error response
+    assert "error" not in result, f"Got error for valid hash with query: {result}"
+    # Must surface the full content
+    assert result.get("source") == "local"
+    assert "original_content" in result
+    assert result["original_content"] == original
+    # Must signal zero query matches, not a retrieval failure
+    assert result.get("count") == 0
+    assert "note" in result

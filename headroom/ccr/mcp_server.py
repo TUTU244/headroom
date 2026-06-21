@@ -424,6 +424,27 @@ class HeadroomMCPServer:
                     "results": results,
                     "count": len(results),
                 }
+            # Query matched nothing — distinguish from "hash not found".
+            # Retrieve the entry directly so the caller gets the full content
+            # and a clear explanation rather than a misleading "not found" error.
+            # See issue #1213.
+            entry = store.retrieve(hash_key)
+            if entry:
+                self._stats.record_retrieval(hash_key)
+                return {
+                    "hash": hash_key,
+                    "source": "local",
+                    "query": query,
+                    "results": [],
+                    "count": 0,
+                    "note": (
+                        f"No items matched query {query!r}. "
+                        "Full original content is included below."
+                    ),
+                    "original_content": entry.original_content,
+                    "original_item_count": entry.original_item_count,
+                    "compressed_item_count": entry.compressed_item_count,
+                }
         else:
             entry = store.retrieve(hash_key)
             if entry:

@@ -32,6 +32,7 @@ use crate::websocket::ws_handler;
 // `req.extensions()` (Phase F PR-F2/F3/F4).
 use headroom_core::auth_mode::{classify as classify_auth_mode, AuthMode};
 use headroom_core::compression_policy::CompressionPolicy;
+use headroom_core::jwt::{read_expiry as read_jwt_expiry, JwtExpiry};
 
 /// Shared state passed to every handler.
 ///
@@ -419,6 +420,35 @@ pub(crate) async fn forward_http(
         CompressionPolicy::for_mode(AuthMode::Payg)
     };
     req.extensions_mut().insert(policy);
+
+    // NLM auth-disconnect fix: for OAuth JWT bearer tokens, decode the
+    // payload segment (no signature validation) to read the `exp` claim.
+    // If the token is already expired, return 401 immediately rather than
+    // forwarding to the upstream and getting an opaque mid-stream
+    // disconnect. Subscription-mode clients manage their own token
+    // lifecycle, so we skip the check there — they already handle
+    // upstream 401s with their own refresh logic.
+    if auth_mode == AuthMode::OAuth {
+        if let Some(expiry) = extract_bearer_jwt_expiry(req.headers()) {
+            if expiry.is_expired() {
+                tracing::warn!(
+                    event = "oauth_jwt_expired",
+                    request_id = %request_id,
+                    path = %path_for_log,
+                    "inbound OAuth JWT has expired; returning 401 before upstream round-trip"
+                );
+                return Ok(build_jwt_expired_response());
+            }
+            if expiry.is_close_to_expiry() {
+                tracing::warn!(
+                    event = "oauth_jwt_expiring_soon",
+                    request_id = %request_id,
+                    path = %path_for_log,
+                    "inbound OAuth JWT expires in < 60s; forwarding but client should refresh"
+                );
+            }
+        }
+    }
 
     // Per PR-A1: structured entry log. The `auth_mode` field is now
     // populated with the real classification result (Phase F PR-F1
@@ -1569,6 +1599,44 @@ async fn run_sse_state_machine(
         }
         SseStreamKind::None => {}
     }
+}
+
+/// Extract the JWT expiry from the `Authorization: Bearer <jwt>` header.
+///
+/// Returns `None` when the header is absent, not a Bearer scheme, or the
+/// token does not look like a JWT (fewer than 3 dot-separated segments).
+/// Returns `Some(JwtExpiry::Unknown)` for 3-segment tokens whose payload
+/// cannot be decoded — the caller should still forward in that case.
+fn extract_bearer_jwt_expiry(headers: &HeaderMap) -> Option<JwtExpiry> {
+    let auth = headers.get("authorization")?.to_str().ok()?;
+    let token = auth.strip_prefix("Bearer ")?;
+    // Only inspect 3-segment tokens (header.payload.signature = JWT shape).
+    if token.split('.').count() < 3 {
+        return None;
+    }
+    Some(read_jwt_expiry(token))
+}
+
+/// Structured 401 response returned when a JWT bearer token is expired.
+///
+/// The body mirrors the Anthropic API error shape so clients that already
+/// parse that shape can display a useful message without extra handling.
+/// `cache-control: no-store` prevents a fronting cache from storing a 401.
+fn build_jwt_expired_response() -> Response<Body> {
+    let body = serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": "authentication_error",
+            "message": "Bearer token has expired. Please refresh your OAuth token and retry."
+        }
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap_or_default();
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header("content-type", "application/json")
+        .header("cache-control", "no-store")
+        .body(Body::from(body_bytes))
+        .unwrap_or_else(|_| Response::builder().status(StatusCode::UNAUTHORIZED).body(Body::empty()).unwrap())
 }
 
 fn ensure_request_id(headers: &HeaderMap) -> String {
